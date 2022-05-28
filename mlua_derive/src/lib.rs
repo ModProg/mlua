@@ -1,7 +1,14 @@
+use itertools::Itertools;
 use proc_macro::TokenStream;
 use proc_macro2::{Ident, Span};
-use quote::quote;
-use syn::{parse_macro_input, AttributeArgs, Error, ItemFn};
+use proc_macro_error::{abort, ResultExt};
+use quote::{quote, ToTokens};
+use quote_use::{format_ident_namespaced, quote_use};
+use syn::{
+    parse_macro_input, parse_quote, parse_quote_spanned, punctuated::Punctuated, spanned::Spanned,
+    Attribute, AttributeArgs, DataEnum, DataStruct, DataUnion, DeriveInput, Error, Expr, Field,
+    Fields, FieldsNamed, FieldsUnnamed, ItemFn, Token, Variant,
+};
 
 #[cfg(feature = "macros")]
 use {
@@ -113,6 +120,247 @@ pub fn chunk(input: TokenStream) -> TokenStream {
     }};
 
     wrapped_code.into()
+}
+
+fn should_skip_field(attrs: &[Attribute]) -> bool {
+    let attr = attrs.iter().find(|attr| attr.path.is_ident("mlua"));
+    // TODO handle multiple attributes
+
+    attr.and_then(|attr| attr.parse_args().ok())
+        .map_or(false, |ident: Ident| ident == "lua" || ident == "skip")
+}
+
+fn named_fields_to_lua(fields: impl IntoIterator<Item = Field>) -> TokenStream2 {
+    let (right, left): (Vec<_>, Vec<_>) = fields
+        .into_iter()
+        .filter_map(|Field { ident, attrs, .. }| {
+            (!should_skip_field(&attrs)).then(|| {
+                let ident = ident.expect("named fields always have idents");
+                let ident_str = ident.to_string();
+                (quote_use!($value.set(#ident_str, #ident)?;), ident)
+            })
+        })
+        .unzip();
+    let count = left.len() as i32;
+
+    quote_use! {
+        # use mlua::prelude::LuaValue;
+        {#(#left),*} => {
+            let $value = lua.create_table_with_capacity(0, #count)?;
+            #(#right)*
+            LuaValue::Table($value)
+        }
+    }
+}
+
+fn unnamed_fields_to_lua(fields: impl IntoIterator<Item = Field>) -> TokenStream2 {
+    let (right, left): (Vec<_>, Vec<_>) = fields
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, Field { attrs, .. })| {
+            (!should_skip_field(&attrs)).then(|| {
+                let ident = format_ident_namespaced!("$field_{i}");
+                (quote_use!(::mlua::ToLua(#ident)?), ident)
+            })
+        })
+        .unzip();
+    quote_use! {
+        # use mlua::prelude::LuaValue;
+        (#(#left),*) => Ok(LuaValue::Table(lua.create_sequence_from([#(#right),*])))
+    }
+}
+
+#[proc_macro_error]
+#[proc_macro_derive(ToLua, attributes(mlua))]
+pub fn to_lua(item: TokenStream) -> TokenStream {
+    let DeriveInput {
+        ident,
+        mut generics,
+        data,
+        ..
+    } = parse_macro_input!(item as DeriveInput);
+
+    let body = match data {
+        syn::Data::Struct(DataStruct {
+            fields: Fields::Named(FieldsNamed { named, .. }),
+            ..
+        }) => {
+            let named = named_fields_to_lua(named);
+            quote_use!(Self #named)
+        }
+        syn::Data::Struct(DataStruct {
+            fields: Fields::Unnamed(FieldsUnnamed { unnamed, .. }),
+            ..
+        }) => {
+            let unnamed = unnamed_fields_to_lua(unnamed);
+            quote_use!(Self #unnamed)
+        }
+        syn::Data::Struct(DataStruct {
+            fields: Fields::Unit,
+            ..
+        }) => abort!(ident, "unit structs are not supported"),
+        syn::Data::Enum(DataEnum { variants, .. }) => {
+            variants.into_iter().map(
+                |Variant {
+                     ident,
+                     fields,
+                     discriminant,
+                     attrs
+                 }| {
+                    match fields {
+                        Fields::Named(FieldsNamed { named, .. }) => {
+                            let named = named_fields_to_lua(named);
+                            quote_use!(Self::#ident #named)
+                        }
+                        Fields::Unnamed(FieldsUnnamed { unnamed, .. }) => {
+                            if unnamed.len() == 1 {
+                                quote_use!(Self::#ident($field) => ::mlua::ToLua::to_lua($field, lua)?)
+                            } else {
+                                let unnamed = unnamed_fields_to_lua(unnamed);
+                                quote_use!(#ident #unnamed)
+                            }
+                        }
+                        Fields::Unit => {
+                            use attribute_derive::Attribute;
+                            #[derive(Attribute)]
+                            #[attribute(ident = "mlua")]
+                            struct Attr {
+                                value: Option<Expr>
+                            }
+                            let Attr{value} = Attr::from_attributes(&attrs).unwrap_or_abort();
+                            // TODO casing/explicit value/int repr
+                            let value = value.map(ToTokens::into_token_stream).unwrap_or_else(|| if let Some((_, discriminant)) = discriminant {
+                                discriminant.into_token_stream()
+                            } else {
+                                ident.to_string().into_token_stream()
+                            });
+                            quote_use!(Self::#ident => ::mlua::ToLua::to_lua(#value, lua)?)
+                        }
+                    }
+                },
+            ).collect::<Punctuated<_, Token![,]>>().into_token_stream()
+        }
+        syn::Data::Union(DataUnion { union_token, .. }) => {
+            abort!(union_token, "unions are not supported")
+        }
+    };
+
+    // Setup lifetimes and generics
+    let generics_clone = generics.clone();
+    let (_, type_generics, _) = generics_clone.split_for_impl();
+
+    let lifetimes = generics.lifetimes().cloned().collect_vec();
+    for lifetime in lifetimes {
+        generics
+            .make_where_clause()
+            .predicates
+            .push(parse_quote_spanned!(lifetime.span()=> #lifetime: '__lua))
+    }
+
+    let mut generics = generics.clone();
+    generics.params.push(parse_quote!('__lua));
+    let (impl_generics, _, where_clause) = generics.split_for_impl();
+
+    quote_use! {
+        # use mlua::{prelude::{Lua, LuaResult, LuaValue}, ToLua};
+
+        #[allow(unreachable_code)]
+        impl #impl_generics ToLua<'__lua> for #ident #type_generics #where_clause {
+            fn to_lua(self, lua: &'__lua Lua) -> LuaResult<LuaValue<'__lua>> {
+                Ok(match self {
+                    #body
+                })
+            }
+        }
+    }
+    .into()
+}
+
+#[proc_macro_error]
+#[proc_macro_derive(FromLua, attributes(mlua))]
+pub fn from_lua(item: TokenStream) -> TokenStream {
+    let DeriveInput {
+        ident,
+        mut generics,
+        data,
+        ..
+    } = parse_macro_input!(item as DeriveInput);
+
+    let mut lua = None;
+
+    let fields = match data {
+        syn::Data::Struct(DataStruct {
+            fields: Fields::Named(FieldsNamed { named: fields, .. }),
+            ..
+        }) => {
+            let fields = fields.into_iter().map(|Field { ident, attrs, .. }| {
+            let ident = ident.expect("named fields always have idents");
+            let attr = attrs
+                .into_iter()
+                .find(|attr| attr.path.is_ident("mlua"));
+            // TODO handle multiple attributes
+            if matches!(&attr, Some(attr) if matches!(attr.parse_args::<Ident>(), Ok(ident) if ident == "lua")) {
+                lua = Some(ident.clone());
+                quote_use!(#ident: lua)
+            } else {
+                let ident_str = ident.to_string();
+                quote_use!(#ident: $value.get(#ident_str)?)
+            }}).collect_vec();
+            quote!({#(#fields),*})
+        }
+        // TODO verify len
+        syn::Data::Struct(DataStruct {
+            fields: Fields::Unnamed(fields),
+            ..
+        }) => {
+            let fields = fields
+                .unnamed
+                .into_iter()
+                .enumerate()
+                .map(|(idx, _)| quote_use!($value.get(#idx)?))
+                .collect_vec();
+            quote!((#(#fields),*))
+        }
+        syn::Data::Struct(DataStruct {
+            fields: Fields::Unit,
+            ..
+        }) => abort!(ident, "unit structs are not supported"),
+        syn::Data::Enum(DataEnum { enum_token, .. }) => {
+            abort!(enum_token, "enums are not (yet) supported")
+        }
+        syn::Data::Union(DataUnion { union_token, .. }) => {
+            abort!(union_token, "unions are not supported")
+        }
+    };
+
+    let generics_clone = generics.clone();
+    let (_, type_generics, _) = generics_clone.split_for_impl();
+
+    // Setup lifetimes and generics
+    let lifetimes = generics.lifetimes().cloned().collect_vec();
+    for lifetime in lifetimes {
+        generics
+            .make_where_clause()
+            .predicates
+            .push(parse_quote_spanned!(lifetime.span()=> '__lua: #lifetime))
+    }
+
+    let mut generics = generics.clone();
+    generics.params.push(parse_quote!('__lua));
+    let (impl_generics, _, where_clause) = generics.split_for_impl();
+
+    quote_use! {
+        # use mlua::prelude::{FromLua, Lua, LuaResult, LuaTable, LuaValue};
+
+        #[allow(unreachable_code)]
+        impl #impl_generics FromLua<'__lua> for #ident #type_generics #where_clause {
+            fn from_lua($value: LuaValue<'__lua>, lua: &'__lua Lua) -> LuaResult<Self> {
+                let $value: LuaTable = FromLua::from_lua($value, lua)?;
+                Ok(Self #fields)
+            }
+        }
+    }
+    .into()
 }
 
 #[cfg(feature = "macros")]

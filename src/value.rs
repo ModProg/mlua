@@ -189,6 +189,9 @@ pub trait FromLua<'lua>: Sized {
     fn from_lua(lua_value: Value<'lua>, lua: &'lua Lua) -> Result<Self>;
 }
 
+#[cfg(feature = "macros")]
+pub use mlua_derive::{FromLua, ToLua};
+
 /// Multiple Lua values used for both argument passing and also for multiple return values.
 #[derive(Debug, Clone)]
 pub struct MultiValue<'lua>(Vec<Value<'lua>>);
